@@ -1,0 +1,9 @@
+codex_config.local.cmd
+
+__pycache__/
+*.py[cod]
+tests/_test_workspace/
+
+.idea/
+.vscode/
+*.log
