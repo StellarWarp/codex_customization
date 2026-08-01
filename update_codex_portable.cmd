@@ -14,6 +14,8 @@ call "%CONFIG_SCRIPT%"
 if errorlevel 1 goto :failed
 
 set "PYTHON_EXE=%CODEX_PYTHON_EXE%"
+set "PATCH_OPTIONS="
+if "%CODEX_ENABLE_REMOTE_CONTROL_PATCH%"=="1" set "PATCH_OPTIONS=--enable-control-other-devices"
 
 title Update Codex Portable
 
@@ -36,12 +38,13 @@ if not defined PYTHON_EXE (
 
 echo Target: %CODEX_PORTABLE_TARGET%
 echo Python: %PYTHON_EXE%
+echo Control other devices patch: %CODEX_ENABLE_REMOTE_CONTROL_PATCH%
 
 cd /d "%SCRIPT_DIR%"
 
 echo.
 echo Running read-only compatibility check...
-"%PYTHON_EXE%" -B "%PATCH_SCRIPT%"
+"%PYTHON_EXE%" -B "%PATCH_SCRIPT%" %PATCH_OPTIONS%
 if errorlevel 1 (
     echo ERROR: Compatibility check failed. The existing portable copy was not changed.
     goto :failed
@@ -52,8 +55,8 @@ if /I "%~1"=="--check-only" (
 )
 
 echo.
-echo Stopping only Codex Desktop processes running from the target directory...
-powershell -NoProfile -ExecutionPolicy Bypass -Command "$ErrorActionPreference='Stop'; try { $root=[IO.Path]::GetFullPath($env:CODEX_PORTABLE_TARGET).TrimEnd('\')+'\'; Get-Process -Name ChatGPT,codex -ErrorAction SilentlyContinue | ForEach-Object { try { $path=$_.Path } catch { $path=$null }; if ($path -and $path.StartsWith($root,[StringComparison]::OrdinalIgnoreCase)) { Stop-Process -Id $_.Id -Force -ErrorAction Stop } }; exit 0 } catch { Write-Error $_; exit 1 }"
+echo Stopping all processes running from the target directory...
+powershell -NoProfile -ExecutionPolicy Bypass -Command "$ErrorActionPreference='Stop'; try { $root=[IO.Path]::GetFullPath($env:CODEX_PORTABLE_TARGET).TrimEnd('\')+'\'; for($attempt=0;$attempt -lt 10;$attempt++){ $matches=@(Get-Process -ErrorAction SilentlyContinue | Where-Object { try { $path=$_.Path } catch { $path=$null }; $path -and $path.StartsWith($root,[StringComparison]::OrdinalIgnoreCase) }); if($matches.Count -eq 0){exit 0}; $matches | Stop-Process -Force -ErrorAction Stop; Start-Sleep -Milliseconds 250 }; throw 'Portable processes are still running after 2.5 seconds.' } catch { Write-Error $_; exit 1 }"
 if errorlevel 1 (
     echo ERROR: Could not stop the existing portable processes.
     goto :failed
@@ -66,7 +69,7 @@ if /I "%~1"=="--check-stop-only" (
 echo.
 echo Building and patching the new portable copy...
 echo The existing portable copy will be deleted after the staged copy is verified.
-"%PYTHON_EXE%" -B "%PATCH_SCRIPT%" --apply --replace-output --output-dir "%CODEX_PORTABLE_TARGET%"
+"%PYTHON_EXE%" -B "%PATCH_SCRIPT%" %PATCH_OPTIONS% --apply --replace-output --output-dir "%CODEX_PORTABLE_TARGET%"
 if errorlevel 1 (
     echo ERROR: Portable update failed. Review the output above.
     goto :failed

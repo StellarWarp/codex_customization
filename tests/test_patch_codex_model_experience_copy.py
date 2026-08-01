@@ -1,7 +1,9 @@
 import hashlib
 import json
+import os
 import shutil
 import struct
+import subprocess
 import unittest
 import uuid
 from pathlib import Path
@@ -13,6 +15,9 @@ REQUEST_NAME = "read-service-tier-for-request-TEST.js"
 UI_NAME = "use-service-tier-settings-TEST.js"
 QUERIES_NAME = "model-queries-TEST.js"
 FILTER_NAME = "model-list-filter-TEST.js"
+INITIAL_NAME = "app-initial-TEST.js"
+REMOTE_NAME = "remote-connections-settings-TEST.js"
+MAIN_PATH = ".vite/build/main-TEST.js"
 
 
 def sha256(data: bytes) -> str:
@@ -53,10 +58,50 @@ def make_test_assets() -> dict[str, bytes]:
             "if(u?n.has(r.model):!r.hidden){"
             "return r.supportedReasoningEfforts}})}"
         ).encode(),
+        REMOTE_NAME: (
+            "function H(){let m=r(`782640499`),g=r(x),R=S(),z=!m,"
+            "V=build({showControlOtherDevices:z});"
+            "return{showControlOtherDevices:z,value:V}}"
+        ).encode(),
     }
 
 
-def write_test_asar(path: Path, assets: dict[str, bytes]) -> None:
+def make_current_initial_assets() -> dict[str, bytes]:
+    assets = make_test_assets()
+    current_filter = (
+        "function q({additionalAvailableModels:e,authMethod:t,availableModels:n,"
+        "model:r,useHiddenModels:i}){return e?.has(r.model)===!0||"
+        "(i&&t!==`amazonBedrock`?n.has(r.model):!r.hidden)}"
+        "function filter(){return r.supportedReasoningEfforts}"
+    ).encode()
+    return {
+        INITIAL_NAME: b"".join(
+            assets[name]
+            for name in (REQUEST_NAME, UI_NAME, QUERIES_NAME)
+        )
+        + current_filter,
+    }
+
+
+def make_test_main() -> bytes:
+    return (
+        "var A=createRequire(__filename),j=`remote-control-device-key.node`;"
+        "class N{resourcesPath;addon=null;"
+        "createDeviceKey(e){return this.getAddon().createDeviceKey(e??`hardware_only`)}"
+        "deleteDeviceKey(e){return this.getAddon().deleteDeviceKey(e)}"
+        "getDeviceKeyPublic(e){return this.getAddon().getDeviceKeyPublic(e)}"
+        "signDeviceKey(e,t){return this.getAddon().signDeviceKey(e,t)}"
+        "getAddon(){if(process.platform!==`darwin`)throw Error("
+        "`Remote control device keys are only available on macOS`);"
+        "if(this.resourcesPath==null)throw Error("
+        "`Remote control device keys require resourcesPath`);"
+        "return this.addon??=A((0,p.join)(this.resourcesPath,`native`,j)),this.addon}}"
+    ).encode()
+
+
+def write_test_asar(
+    path: Path, assets: dict[str, bytes], extra_files: dict[str, bytes] | None = None
+) -> None:
     offset = 0
     entries = {}
     payload = bytearray()
@@ -79,6 +124,18 @@ def write_test_asar(path: Path, assets: dict[str, bytes]) -> None:
             }
         }
     }
+    for archive_path, data in (extra_files or {}).items():
+        parts = archive_path.split("/")
+        node = header
+        for part in parts[:-1]:
+            node = node.setdefault("files", {}).setdefault(part, {"files": {}})
+        node.setdefault("files", {})[parts[-1]] = {
+            "size": len(data),
+            "offset": str(offset),
+            "integrity": integrity(data),
+        }
+        payload.extend(data)
+        offset += len(data)
     header_bytes = json.dumps(header, separators=(",", ":")).encode()
     aligned = patcher.align4(len(header_bytes))
     prefix = struct.pack("<IIII", 4, aligned + 8, aligned + 4, len(header_bytes))
@@ -89,7 +146,11 @@ def write_test_asar(path: Path, assets: dict[str, bytes]) -> None:
 def make_package(root: Path, assets: dict[str, bytes] | None = None) -> tuple[Path, Path]:
     package_root = root / "OpenAI.Codex_TEST"
     app_dir = package_root / "app"
-    write_test_asar(app_dir / "resources" / "app.asar", assets or make_test_assets())
+    write_test_asar(
+        app_dir / "resources" / "app.asar",
+        assets or make_test_assets(),
+        {MAIN_PATH: make_test_main()},
+    )
     (app_dir / "ChatGPT.exe").write_bytes(b"test launcher")
     manifest = """<?xml version="1.0" encoding="utf-8"?>
 <Package xmlns="http://schemas.microsoft.com/appx/manifest/foundation/windows10">
@@ -118,7 +179,7 @@ class ModelExperiencePatchTests(unittest.TestCase):
         self.assertEqual(archive.data_base, 16 + patcher.align4(archive.header_size))
         self.assertTrue(archive.read_asset(REQUEST_NAME).startswith(b"import"))
 
-    def test_plan_contains_four_equal_length_patches(self) -> None:
+    def test_remote_control_patch_is_disabled_by_default(self) -> None:
         _, app_dir = make_package(self.root)
         plan = patcher.build_patch_plan(
             app_dir,
@@ -126,11 +187,44 @@ class ModelExperiencePatchTests(unittest.TestCase):
             scan_embedded_hashes=False,
         )
         self.assertEqual(len(plan.asset_patches), 4)
+        self.assertEqual(plan.external_files, ())
+        self.assertNotIn(
+            "CRC_UI", patcher.load_asar(app_dir / "resources" / "app.asar")
+            .read_asset(REMOTE_NAME)
+            .decode()
+        )
+
+    def test_opt_in_plan_contains_six_equal_length_patches_and_shim(self) -> None:
+        _, app_dir = make_package(self.root)
+        plan = patcher.build_patch_plan(
+            app_dir,
+            check_javascript=False,
+            scan_embedded_hashes=False,
+            enable_control_other_devices=True,
+        )
+        self.assertEqual(len(plan.asset_patches), 6)
+        self.assertEqual(len(plan.external_files), 1)
         self.assertEqual(len(plan.archive.header_bytes), len(plan.header_after))
         self.assertNotEqual(plan.old_header_sha256, plan.new_header_sha256)
         for asset_patch in plan.asset_patches:
             self.assertEqual(len(asset_patch.old_bytes), len(asset_patch.new_bytes))
             self.assertNotEqual(asset_patch.old_sha256, asset_patch.new_sha256)
+
+    def test_current_model_filter_in_merged_initial_bundle_is_patched(self) -> None:
+        _, app_dir = make_package(self.root, make_current_initial_assets())
+        plan = patcher.build_patch_plan(
+            app_dir,
+            check_javascript=False,
+            scan_embedded_hashes=False,
+        )
+        self.assertEqual(len(plan.asset_patches), 1)
+        asset_patch = plan.asset_patches[0]
+        self.assertEqual(asset_patch.name, f"webview/assets/{INITIAL_NAME}")
+        self.assertIn("CFM_ALLOW", asset_patch.new_bytes.decode())
+        self.assertNotIn(
+            "e?.has(r.model)===!0||(i&&t!==`amazonBedrock`?n.has(r.model):!r.hidden)",
+            asset_patch.new_bytes.decode(),
+        )
 
     def test_apply_updates_assets_header_and_embedded_hash(self) -> None:
         _, source_app = make_package(self.root)
@@ -142,6 +236,7 @@ class ModelExperiencePatchTests(unittest.TestCase):
             source_app,
             check_javascript=False,
             scan_embedded_hashes=True,
+            enable_control_other_devices=True,
         )
         self.assertEqual(len(plan.embedded_references), 1)
         output_app = self.root / "portable-app"
@@ -154,12 +249,22 @@ class ModelExperiencePatchTests(unittest.TestCase):
         ui = archive.read_asset(UI_NAME).decode()
         queries = archive.read_asset(QUERIES_NAME).decode()
         model_filter = archive.read_asset(FILTER_NAME).decode()
+        remote_settings = archive.read_asset(REMOTE_NAME).decode()
+        main = archive.read_file(MAIN_PATH).decode()
         self.assertIn("CFM_REQ", request)
         self.assertNotIn("if(n!==`chatgpt`)return!1;", request)
         self.assertIn("||d   ,p=1&&!f", ui)
         self.assertIn("useHiddenModels:!0", queries)
         self.assertIn("CFM_ALLOW", model_filter)
         self.assertNotIn("u?n.has(r.model):!r.hidden", model_filter)
+        self.assertIn("CRC_UI", remote_settings)
+        self.assertIn("CRC_KEY", main)
+        self.assertIn(patcher.DEVICE_KEY_SHIM_NAME, main)
+        shim = output_app / "resources" / patcher.DEVICE_KEY_SHIM_NAME
+        self.assertTrue(shim.is_file())
+        self.assertEqual(
+            patcher.sha256_hex(shim.read_bytes()), plan.external_files[0].sha256
+        )
         self.assertIn(plan.new_header_sha256.encode(), (output_app / binary.name).read_bytes())
         self.assertNotIn(plan.old_header_sha256.encode(), (output_app / binary.name).read_bytes())
 
@@ -246,6 +351,48 @@ class ModelExperiencePatchTests(unittest.TestCase):
         version, launcher = patcher.read_package_metadata(package_root)
         self.assertEqual(version, "1.2.3.4")
         self.assertEqual(launcher, Path("ChatGPT.exe"))
+
+    def test_windows_device_key_shim_signs_and_deletes_with_dpapi(self) -> None:
+        node = shutil.which("node")
+        if node is None:
+            self.skipTest("node is not available")
+        shim = patcher.DEVICE_KEY_SHIM_SOURCE.resolve()
+        script = r"""
+const crypto = require("node:crypto");
+const shim = require(process.argv[1]);
+(async () => {
+  const payload = Buffer.from("codex-device-key-test", "utf8");
+  const created = await shim.createDeviceKey("allow_os_protected_nonextractable");
+  const publicView = await shim.getDeviceKeyPublic(created.keyId);
+  const signed = await shim.signDeviceKey(created.keyId, payload);
+  const publicKey = crypto.createPublicKey({
+    key: Buffer.from(publicView.publicKeySpkiDerBase64, "base64"),
+    format: "der",
+    type: "spki",
+  });
+  if (!crypto.verify("sha256", payload, publicKey, Buffer.from(signed.signatureDerBase64, "base64"))) {
+    throw new Error("signature verification failed");
+  }
+  await shim.deleteDeviceKey(created.keyId);
+  try {
+    await shim.getDeviceKeyPublic(created.keyId);
+    throw new Error("deleted key remained readable");
+  } catch (error) {
+    if (error.message === "deleted key remained readable") throw error;
+  }
+})().catch((error) => { console.error(error); process.exit(1); });
+"""
+        env = os.environ.copy()
+        env["CODEX_HOME"] = str(self.root / "codex-home")
+        completed = subprocess.run(
+            [node, "-e", script, str(shim)],
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env=env,
+            check=False,
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
 
 
 if __name__ == "__main__":

@@ -3,6 +3,7 @@
 rem Shared defaults. Override machine-specific values in codex_config.local.cmd.
 if not defined CODEX_PORTABLE_TARGET set "CODEX_PORTABLE_TARGET=D:\PortableApp\CodexPortable"
 if not defined CODEX_PROXY set "CODEX_PROXY=http://127.0.0.1:7890"
+if not defined CODEX_ENABLE_REMOTE_CONTROL_PATCH set "CODEX_ENABLE_REMOTE_CONTROL_PATCH=0"
 
 if exist "%~dp0codex_config.local.cmd" call "%~dp0codex_config.local.cmd"
 
