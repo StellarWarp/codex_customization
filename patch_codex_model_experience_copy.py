@@ -436,7 +436,17 @@ def patch_model_allowlist(text: str) -> tuple[str, bool]:
         rf"\|\|\((?P<flag>{IDENT})&&(?P<auth>{IDENT})!==`amazonBedrock`\?"
         rf"(?P<models>{IDENT})\.has\((?P=model)\.model\):!(?P=model)\.hidden\)"
     )
-    matches = [*legacy_pattern.finditer(text), *current_pattern.finditer(text)]
+    latest_pattern = re.compile(
+        rf"(?P<additional>{IDENT})\?\.has\((?P<model>{IDENT})\.model\)===!0"
+        rf"\|\|(?P=model)\.model!==`codex-auto-review`&&"
+        rf"\((?P<flag>{IDENT})&&!{IDENT}&&(?P<auth>{IDENT})!==`amazonBedrock`\?"
+        rf"(?P<models>{IDENT})\.has\((?P=model)\.model\):!(?P=model)\.hidden\)"
+    )
+    matches = [
+        *legacy_pattern.finditer(text),
+        *current_pattern.finditer(text),
+        *latest_pattern.finditer(text),
+    ]
     if len(matches) != 1 or "supportedReasoningEfforts" not in text:
         raise PatchError(
             "model allowlist filter is unsupported or ambiguous: "
