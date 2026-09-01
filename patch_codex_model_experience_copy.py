@@ -5,17 +5,11 @@ The source Store/MSIX package is always treated as read-only. By default the
 tool only analyzes the installed package. Passing --apply copies the complete
 app directory to a new output directory and patches that copy in place.
 
-The patch enables the model-experience features that are locally present but
-gated for non-ChatGPT authentication:
+The patch enables the Fast Mode features that are locally present but gated
+for non-ChatGPT authentication:
 
 * Fast Mode request eligibility
 * Fast Mode UI eligibility
-* hidden models by default
-* all models returned by list-models-for-host in the model picker
-An optional --enable-control-other-devices patch exposes the currently hidden
-Windows workflow and supplies a DPAPI-protected device-key shim. It is disabled
-by default because the native app server still lacks HTTP proxy support for its
-remote-control WebSocket and future Desktop releases may add official support.
 
 The ASAR file is patched with byte-for-byte equal-length replacements. The
 script also updates the per-file and per-block SHA-256 values in the ASAR JSON
@@ -51,8 +45,6 @@ class PatchError(RuntimeError):
 IDENT = r"[A-Za-z_$][A-Za-z0-9_$]*"
 WINDOWS_APPS_PART = "windowsapps"
 EXECUTABLE_SUFFIXES = {".exe", ".dll"}
-DEVICE_KEY_SHIM_NAME = "remote-control-device-key.windows.cjs"
-DEVICE_KEY_SHIM_SOURCE = Path(__file__).parent / "assets" / DEVICE_KEY_SHIM_NAME
 
 
 @dataclass(frozen=True)
@@ -144,19 +136,11 @@ class EmbeddedHashReference:
 
 
 @dataclass(frozen=True)
-class ExternalFile:
-    source: Path
-    relative_path: Path
-    sha256: str
-
-
-@dataclass(frozen=True)
 class PatchPlan:
     archive: AsarArchive
     asset_patches: tuple[AssetPatch, ...]
     header_after: bytes
     embedded_references: tuple[EmbeddedHashReference, ...]
-    external_files: tuple[ExternalFile, ...]
 
     @property
     def old_header_sha256(self) -> str:
@@ -295,47 +279,6 @@ def find_asset_for_patch(
     )
 
 
-def find_archive_file_for_patch(
-    archive: AsarArchive,
-    *,
-    feature: str,
-    required_needles: Sequence[bytes],
-    patcher,
-) -> str:
-    content_matches: list[str] = []
-    invalid_candidates: list[tuple[str, PatchError]] = []
-    for archive_path, entry in archive.iter_file_entries():
-        if not archive_path.endswith((".js", ".mjs", ".cjs")) or entry.get(
-            "unpacked"
-        ):
-            continue
-        data = archive.read_file(archive_path)
-        if not all(needle in data for needle in required_needles):
-            continue
-        try:
-            text = data.decode("utf-8")
-        except UnicodeDecodeError:
-            continue
-        try:
-            patcher(text)
-        except PatchError as exc:
-            invalid_candidates.append((archive_path, exc))
-            continue
-        content_matches.append(archive_path)
-
-    if len(content_matches) == 1:
-        return content_matches[0]
-    if not content_matches and len(invalid_candidates) == 1:
-        archive_path, error = invalid_candidates[0]
-        raise PatchError(
-            f"{feature} candidate {archive_path} is unsupported: {error}"
-        )
-    raise PatchError(
-        f"expected one content-matched ASAR file for {feature}, found "
-        f"{len(content_matches)}: {content_matches}"
-    )
-
-
 def fixed_comment(total_length: int, marker: str) -> str:
     minimum = len(marker) + 4
     if total_length < minimum:
@@ -405,120 +348,6 @@ def patch_fast_ui(text: str) -> tuple[str, bool]:
     replacement = new_loading + "," + new_allowed
     if len(replacement.encode("utf-8")) != len(match.group(0).encode("utf-8")):
         raise PatchError("Fast UI replacement changed the UTF-8 byte length")
-    return text[: match.start()] + replacement + text[match.end() :], True
-
-
-def patch_hidden_models_default(text: str) -> tuple[str, bool]:
-    old = "useHiddenModels:!1"
-    new = "useHiddenModels:!0"
-    old_count = text.count(old)
-    new_count = text.count(new)
-    if old_count == 0 and new_count >= 1:
-        return text, False
-    if old_count != 1:
-        raise PatchError(
-            "hidden-model default is unsupported or ambiguous: "
-            f"expected one {old!r}, found {old_count}"
-        )
-    return text.replace(old, new, 1), True
-
-
-def patch_model_allowlist(text: str) -> tuple[str, bool]:
-    marker = "CFM_ALLOW"
-    if marker in text:
-        return text, False
-    legacy_pattern = re.compile(
-        rf"(?P<flag>{IDENT})\?(?P<models>{IDENT})\.has\("
-        rf"(?P<model>{IDENT})\.model\):!(?P=model)\.hidden"
-    )
-    current_pattern = re.compile(
-        rf"(?P<additional>{IDENT})\?\.has\((?P<model>{IDENT})\.model\)===!0"
-        rf"\|\|\((?P<flag>{IDENT})&&(?P<auth>{IDENT})!==`amazonBedrock`\?"
-        rf"(?P<models>{IDENT})\.has\((?P=model)\.model\):!(?P=model)\.hidden\)"
-    )
-    latest_pattern = re.compile(
-        rf"(?P<additional>{IDENT})\?\.has\((?P<model>{IDENT})\.model\)===!0"
-        rf"\|\|(?P=model)\.model!==`codex-auto-review`&&"
-        rf"\((?P<flag>{IDENT})&&!{IDENT}&&(?P<auth>{IDENT})!==`amazonBedrock`\?"
-        rf"(?P<models>{IDENT})\.has\((?P=model)\.model\):!(?P=model)\.hidden\)"
-    )
-    matches = [
-        *legacy_pattern.finditer(text),
-        *current_pattern.finditer(text),
-        *latest_pattern.finditer(text),
-    ]
-    if len(matches) != 1 or "supportedReasoningEfforts" not in text:
-        raise PatchError(
-            "model allowlist filter is unsupported or ambiguous: "
-            f"expected one visibility expression, found {len(matches)}"
-        )
-    match = matches[0]
-    old = match.group(0)
-    replacement = "!0" + fixed_comment(len(old) - 2, marker)
-    if len(replacement.encode("utf-8")) != len(old.encode("utf-8")):
-        raise PatchError("model allowlist replacement changed UTF-8 byte length")
-    return text[: match.start()] + replacement + text[match.end() :], True
-
-
-def patch_control_other_devices_ui(text: str) -> tuple[str, bool]:
-    marker = "CRC_UI"
-    if marker in text:
-        return text, False
-    gate_pattern = re.compile(
-        rf"(?P<gate>{IDENT})=(?P<check>{IDENT})\(`782640499`\)"
-    )
-    matches = list(gate_pattern.finditer(text))
-    if len(matches) != 1 or "showControlOtherDevices" not in text:
-        raise PatchError(
-            "Control other devices UI gate is unsupported or ambiguous: "
-            f"expected one Statsig gate, found {len(matches)}"
-        )
-    match = matches[0]
-    gate = match.group("gate")
-    tail = text[match.end() : match.end() + 4000]
-    uses = list(re.finditer(rf"{IDENT}=!{re.escape(gate)}(?=,)", tail))
-    if len(uses) != 1:
-        raise PatchError(
-            "Control other devices UI gate does not have one negated visibility use: "
-            f"found {len(uses)}"
-        )
-    old = match.group(0)
-    base = f"{gate}=!1"
-    replacement = base + fixed_comment(len(old) - len(base), marker)
-    return text[: match.start()] + replacement + text[match.end() :], True
-
-
-def patch_windows_device_key_loader(text: str) -> tuple[str, bool]:
-    marker = "CRC_KEY"
-    if marker in text:
-        return text, False
-    pattern = re.compile(
-        r"getAddon\(\)\{if\(process\.platform!==`darwin`\)throw Error\("
-        r"`Remote control device keys are only available on macOS`\);"
-        r"if\(this\.resourcesPath==null\)throw Error\("
-        r"`Remote control device keys require resourcesPath`\);"
-        rf"return this\.addon\?\?=(?P<loader>{IDENT})\(\(0,"
-        rf"(?P<path>{IDENT})\.join\)\(this\.resourcesPath,`native`,"
-        rf"(?P<module>{IDENT})\)\),this\.addon\}}"
-    )
-    matches = list(pattern.finditer(text))
-    if len(matches) != 1 or "remote-control-device-key.node" not in text:
-        raise PatchError(
-            "Windows device-key loader is unsupported or ambiguous: "
-            f"expected one macOS-only getAddon method, found {len(matches)}"
-        )
-    match = matches[0]
-    replacement = (
-        "getAddon(){if(this.resourcesPath==null)throw Error("
-        "`Remote control device keys require resourcesPath`);"
-        f"return this.addon??={match.group('loader')}((0,"
-        f"{match.group('path')}.join)(this.resourcesPath,"
-        f"`{DEVICE_KEY_SHIM_NAME}`)),this.addon}}"
-    )
-    old = match.group(0)
-    if len(replacement) > len(old):
-        raise PatchError("Windows device-key loader cannot remain equal-length")
-    replacement += fixed_comment(len(old) - len(replacement), marker)
     return text[: match.start()] + replacement + text[match.end() :], True
 
 
@@ -701,7 +530,6 @@ def build_patch_plan(
     check_javascript: bool = True,
     node_path: str | None = None,
     scan_embedded_hashes: bool = True,
-    enable_control_other_devices: bool = False,
 ) -> PatchPlan:
     app_dir = app_dir.resolve()
     asar_path = app_dir / "resources" / "app.asar"
@@ -719,28 +547,7 @@ def build_patch_plan(
             (b"isServiceTierAllowed", b"featureRequirements?.fast_mode"),
             patch_fast_ui,
         ),
-        (
-            "Hidden models default",
-            "model-queries-",
-            (b"useHiddenModels",),
-            patch_hidden_models_default,
-        ),
-        (
-            "Model allowlist filter",
-            "model-list-filter-",
-            (b"supportedReasoningEfforts", b".hidden"),
-            patch_model_allowlist,
-        ),
     ]
-    if enable_control_other_devices:
-        target_specs.append(
-            (
-                "Control other devices UI",
-                "remote-connections-settings-",
-                (b"782640499", b"showControlOtherDevices"),
-                patch_control_other_devices_ui,
-            )
-        )
     targets = tuple(
         (
             feature,
@@ -758,22 +565,6 @@ def build_patch_plan(
     targets_by_asset: dict[str, list[tuple[str, object]]] = defaultdict(list)
     for feature, name, patcher in targets:
         targets_by_asset[f"webview/assets/{name}"].append((feature, patcher))
-
-    if enable_control_other_devices:
-        main_feature = "Windows remote-control device keys"
-        main_path = find_archive_file_for_patch(
-            archive,
-            feature=main_feature,
-            required_needles=(
-                b"remote-control-device-key.node",
-                b"Remote control device keys are only available on macOS",
-                b"signDeviceKey",
-            ),
-            patcher=patch_windows_device_key_loader,
-        )
-        targets_by_asset[main_path].append(
-            (main_feature, patch_windows_device_key_loader)
-        )
 
     patches: list[AssetPatch] = []
     for name, grouped_targets in targets_by_asset.items():
@@ -794,25 +585,11 @@ def build_patch_plan(
         if scan_embedded_hashes and patches
         else ()
     )
-    external_files: tuple[ExternalFile, ...] = ()
-    if enable_control_other_devices:
-        if not DEVICE_KEY_SHIM_SOURCE.is_file():
-            raise PatchError(
-                f"Windows device-key shim is missing: {DEVICE_KEY_SHIM_SOURCE}"
-            )
-        external_files = (
-            ExternalFile(
-                source=DEVICE_KEY_SHIM_SOURCE.resolve(),
-                relative_path=Path("resources") / DEVICE_KEY_SHIM_NAME,
-                sha256=sha256_hex(DEVICE_KEY_SHIM_SOURCE.read_bytes()),
-            ),
-        )
     return PatchPlan(
         archive=archive,
         asset_patches=tuple(patches),
         header_after=header_after,
         embedded_references=references,
-        external_files=external_files,
     )
 
 
@@ -871,13 +648,18 @@ def remove_tree_safely(path: Path, required_parent: Path) -> None:
     shutil.rmtree(path, onexc=clear_readonly_and_retry)
 
 
-def write_install_marker(output_app: Path, version: str) -> None:
+def write_install_marker(
+    output_app: Path,
+    version: str,
+    source_package_root: Path,
+) -> None:
     marker = output_app / ".codex-portable-managed.json"
     marker.write_text(
         json.dumps(
             {
                 "managed_by": Path(__file__).name,
                 "store_version": version,
+                "source_package_root": str(source_package_root.resolve()),
             },
             indent=2,
         )
@@ -893,10 +675,6 @@ def apply_patch_plan(plan: PatchPlan, source_app: Path, output_app: Path) -> Non
         raise PatchError("refusing to patch the source application directory")
     if path_mentions_windowsapps(output_app):
         raise PatchError("refusing to patch a WindowsApps path")
-
-    for external in plan.external_files:
-        if sha256_hex(external.source.read_bytes()) != external.sha256:
-            raise PatchError(f"external patch file changed after planning: {external.source}")
 
     output_asar = output_app / "resources" / "app.asar"
     current = load_asar(output_asar)
@@ -933,11 +711,6 @@ def apply_patch_plan(plan: PatchPlan, source_app: Path, output_app: Path) -> Non
             handle.flush()
             os.fsync(handle.fileno())
 
-    for external in plan.external_files:
-        destination = output_app / external.relative_path
-        destination.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(external.source, destination)
-
     verify_applied_plan(plan, output_app)
 
 
@@ -966,14 +739,6 @@ def verify_applied_plan(plan: PatchPlan, output_app: Path) -> None:
                         f"embedded header hash verification failed: {binary_path}"
                     )
 
-    for external in plan.external_files:
-        destination = output_app / external.relative_path
-        if not destination.is_file():
-            raise PatchError(f"external patch file is missing: {destination}")
-        if sha256_hex(destination.read_bytes()) != external.sha256:
-            raise PatchError(f"external patch file verification failed: {destination}")
-
-
 def install_or_replace_app_copy(
     plan: PatchPlan,
     source_app: Path,
@@ -990,7 +755,7 @@ def install_or_replace_app_copy(
     if not replace_existing:
         copy_app_directory(source_app, output_dir)
         apply_patch_plan(plan, source_app, output_dir)
-        write_install_marker(output_dir, version)
+        write_install_marker(output_dir, version, source_app.parent)
         if not (output_dir / launcher_relative).is_file():
             raise PatchError(
                 f"copied launcher does not exist: {output_dir / launcher_relative}"
@@ -1003,20 +768,31 @@ def install_or_replace_app_copy(
     token = uuid.uuid4().hex
     parent = output_dir.parent
     staging = parent / f".{output_dir.name}.staging-{token}"
+    previous = parent / f".{output_dir.name}.previous-{token}"
+    moved_previous = False
+    installed_new = False
 
     try:
         copy_app_directory(source_app, staging)
         apply_patch_plan(plan, source_app, staging)
-        write_install_marker(staging, version)
+        write_install_marker(staging, version, source_app.parent)
         if not (staging / launcher_relative).is_file():
             raise PatchError(
                 f"staged launcher does not exist: {staging / launcher_relative}"
             )
 
         if output_dir.exists():
-            remove_tree_safely(output_dir, parent)
+            output_dir.rename(previous)
+            moved_previous = True
         staging.rename(output_dir)
+        installed_new = True
+
+        if moved_previous:
+            remove_tree_safely(previous, parent)
     except Exception:
+        if not installed_new and moved_previous and not output_dir.exists():
+            previous.rename(output_dir)
+            moved_previous = False
         if staging.exists():
             remove_tree_safely(staging, parent)
         raise
@@ -1032,6 +808,27 @@ def package_root_from_candidate(candidate: Path) -> Path | None:
 
 
 def discover_package_root() -> Path:
+    configured_candidates: list[Path] = []
+    configured_root = os.environ.get("CODEX_PACKAGE_ROOT")
+    if configured_root:
+        configured_candidates.append(Path(configured_root))
+
+    portable_target = os.environ.get("CODEX_PORTABLE_TARGET")
+    if portable_target:
+        marker_path = Path(portable_target) / ".codex-portable-managed.json"
+        try:
+            marker = json.loads(marker_path.read_text(encoding="ascii"))
+            marker_root = marker.get("source_package_root")
+            if isinstance(marker_root, str) and marker_root:
+                configured_candidates.append(Path(marker_root))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+            pass
+
+    for candidate in configured_candidates:
+        root = package_root_from_candidate(candidate)
+        if root is not None:
+            return root
+
     command = (
         "$pkg = Get-AppxPackage -Name OpenAI.Codex | "
         "Sort-Object Version -Descending | Select-Object -First 1; "
@@ -1161,13 +958,6 @@ def print_plan(
             )
     else:
         print("All configured ASAR patches are already present.")
-    if plan.external_files:
-        print("External portable files:")
-        for external in plan.external_files:
-            print(
-                f"  - {external.relative_path} "
-                f"(source={external.source}, sha256={external.sha256})"
-            )
     if plan.embedded_references:
         print("Embedded ASAR header hash references:")
         for reference in plan.embedded_references:
@@ -1179,9 +969,7 @@ def print_plan(
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Analyze or create a copied Codex Desktop app with Fast Mode and "
-            "model visibility patches. Windows Control other devices support is "
-            "optional. "
+            "Analyze or create a copied Codex Desktop app with Fast Mode patches. "
             "The Store package is never modified."
         )
     )
@@ -1206,14 +994,6 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         help=(
             "replace an existing output directory after a staged copy passes all "
             "patch and verification checks"
-        ),
-    )
-    parser.add_argument(
-        "--enable-control-other-devices",
-        action="store_true",
-        help=(
-            "apply the experimental Windows Control other devices UI and "
-            "device-key shim patches (disabled by default)"
         ),
     )
     parser.add_argument(
@@ -1244,7 +1024,6 @@ def main(argv: Sequence[str] | None = None) -> int:
                 app_dir,
                 check_javascript=False,
                 scan_embedded_hashes=not args.skip_embedded_hash_scan,
-                enable_control_other_devices=args.enable_control_other_devices,
             )
         else:
             with prepared_node_path(package_root) as node_path:
@@ -1253,7 +1032,6 @@ def main(argv: Sequence[str] | None = None) -> int:
                     check_javascript=True,
                     node_path=node_path,
                     scan_embedded_hashes=not args.skip_embedded_hash_scan,
-                    enable_control_other_devices=args.enable_control_other_devices,
                 )
         print_plan(package_root, app_dir, version, launcher_relative, plan)
 

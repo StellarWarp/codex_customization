@@ -40,8 +40,5 @@ runtime data shape rather than the already identified effort/Statsig filters.
 
 ## Decision
 
-Ultra is not required for the current workflow. The repository is therefore
-rolled back to `a7f52f85d79043e018e34dc21b8ba4795f9d9f05`, which retains the
-model visibility matcher repair while removing the unsuccessful Ultra-specific
-experiments.
-
+Ultra is not required for the current workflow. The unsuccessful Ultra-specific
+experiments were therefore removed.

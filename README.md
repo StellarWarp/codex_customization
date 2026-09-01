@@ -3,11 +3,10 @@
 Windows scripts for building and launching a patched portable copy of Codex
 Desktop while keeping the installed Microsoft Store/MSIX package unchanged.
 
-The portable build enables Fast Mode and custom/hidden model visibility. An
-experimental patch for the shipped `Settings > Connections > Control other
-devices` workflow is available but disabled by default. It does not rebuild or
-replace the Rust `resources\codex.exe` app server, whose remote-control
-WebSocket currently does not honor the configured HTTP proxy.
+The portable build enables Fast Mode.
+
+Model availability and hidden-model behavior are left unchanged and follow the
+official Codex Desktop implementation.
 
 ## Configuration
 
@@ -16,8 +15,12 @@ Shared defaults live in `codex_config.cmd`:
 - `CODEX_PORTABLE_TARGET`: destination of the portable application.
 - `CODEX_PROXY`: proxy injected by both launchers.
 - `CODEX_PYTHON_EXE`: optional explicit Python interpreter.
-- `CODEX_ENABLE_REMOTE_CONTROL_PATCH`: set to `1` to enable the experimental
-  remote-control UI and Windows device-key shim; defaults to `0`.
+- `CODEX_PACKAGE_ROOT`: optional Store package location fallback for restricted
+  shells where `Get-AppxPackage` cannot see Codex.
+
+The portable target defaults to `%USERPROFILE%\PortableApp\CodexPortable`.
+Python is auto-detected from active Conda environments and common Miniconda or
+Anaconda locations under both `%LOCALAPPDATA%` and `%USERPROFILE%`.
 
 For settings that differ between computers, copy
 `codex_config.local.example.cmd` to `codex_config.local.cmd` and edit the
@@ -40,12 +43,6 @@ validation. Remove the Start Menu shortcuts with:
 ```cmd
 install_codex_start_menu_shortcuts.cmd --remove
 ```
-
-When the optional patch is enabled, first enable MFA on the OpenAI/ChatGPT
-account. Encrypted Windows device keys are stored in `%CODEX_HOME%\remote-control-device-keys.windows.json`,
-or under `%USERPROFILE%\.codex` when `CODEX_HOME` is unset. The patch does not
-make the native remote-control WebSocket use `CODEX_PROXY`; a TUN connection or
-a separately rebuilt native app server is still required on affected releases.
 
 ## New Computer
 

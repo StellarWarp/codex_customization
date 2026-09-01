@@ -14,8 +14,6 @@ call "%CONFIG_SCRIPT%"
 if errorlevel 1 goto :failed
 
 set "PYTHON_EXE=%CODEX_PYTHON_EXE%"
-set "PATCH_OPTIONS="
-if "%CODEX_ENABLE_REMOTE_CONTROL_PATCH%"=="1" set "PATCH_OPTIONS=--enable-control-other-devices"
 
 title Update Codex Portable
 
@@ -35,16 +33,20 @@ if not defined PYTHON_EXE (
     echo Configure CODEX_PYTHON_EXE in codex_config.local.cmd.
     goto :failed
 )
+if not exist "%PYTHON_EXE%" (
+    echo ERROR: The configured Python interpreter does not exist:
+    echo   %PYTHON_EXE%
+    goto :failed
+)
 
 echo Target: %CODEX_PORTABLE_TARGET%
 echo Python: %PYTHON_EXE%
-echo Control other devices patch: %CODEX_ENABLE_REMOTE_CONTROL_PATCH%
 
 cd /d "%SCRIPT_DIR%"
 
 echo.
 echo Running read-only compatibility check...
-"%PYTHON_EXE%" -B "%PATCH_SCRIPT%" %PATCH_OPTIONS%
+"%PYTHON_EXE%" -B "%PATCH_SCRIPT%"
 if errorlevel 1 (
     echo ERROR: Compatibility check failed. The existing portable copy was not changed.
     goto :failed
@@ -52,6 +54,14 @@ if errorlevel 1 (
 if /I "%~1"=="--check-only" (
     echo Check-only mode completed successfully.
     exit /b 0
+)
+
+for %%I in ("%CODEX_PORTABLE_TARGET%") do set "CODEX_PORTABLE_PARENT=%%~dpI"
+if not exist "%CODEX_PORTABLE_PARENT%" mkdir "%CODEX_PORTABLE_PARENT%"
+if errorlevel 1 (
+    echo ERROR: Could not create the portable target parent directory:
+    echo   %CODEX_PORTABLE_PARENT%
+    goto :failed
 )
 
 echo.
@@ -67,9 +77,8 @@ if /I "%~1"=="--check-stop-only" (
 )
 
 echo.
-echo Building and patching the new portable copy...
-echo The existing portable copy will be deleted after the staged copy is verified.
-"%PYTHON_EXE%" -B "%PATCH_SCRIPT%" %PATCH_OPTIONS% --apply --replace-output --output-dir "%CODEX_PORTABLE_TARGET%"
+echo Building, patching, and atomically replacing the portable copy...
+"%PYTHON_EXE%" -B "%PATCH_SCRIPT%" --apply --replace-output --output-dir "%CODEX_PORTABLE_TARGET%"
 if errorlevel 1 (
     echo ERROR: Portable update failed. Review the output above.
     goto :failed
