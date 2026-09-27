@@ -4,6 +4,7 @@ setlocal EnableExtensions
 set "SCRIPT_DIR=%~dp0"
 set "CONFIG_SCRIPT=%SCRIPT_DIR%codex_config.cmd"
 set "PATCH_SCRIPT=%SCRIPT_DIR%patch_codex_model_experience_copy.py"
+set "CATALOG_SCRIPT=%SCRIPT_DIR%sync_codex_model_catalog.py"
 set "PORTABLE_LAUNCHER=%SCRIPT_DIR%launch_codex_portable.cmd"
 if not exist "%CONFIG_SCRIPT%" (
     echo ERROR: Shared configuration was not found:
@@ -25,6 +26,11 @@ if not exist "%PATCH_SCRIPT%" (
 if not exist "%PORTABLE_LAUNCHER%" (
     echo ERROR: Portable launcher script not found:
     echo   %PORTABLE_LAUNCHER%
+    goto :failed
+)
+if not exist "%CATALOG_SCRIPT%" (
+    echo ERROR: Model catalog script not found:
+    echo   %CATALOG_SCRIPT%
     goto :failed
 )
 
@@ -51,7 +57,15 @@ if errorlevel 1 (
     echo ERROR: Compatibility check failed. The existing portable copy was not changed.
     goto :failed
 )
+
 if /I "%~1"=="--check-only" (
+    echo.
+    echo Checking the custom model catalog...
+    "%PYTHON_EXE%" -B "%CATALOG_SCRIPT%" --check-only
+    if errorlevel 1 (
+        echo WARNING: The model catalog could not be validated. Models served by the
+        echo          custom provider may be missing from the model picker.
+    )
     echo Check-only mode completed successfully.
     exit /b 0
 )
@@ -87,6 +101,15 @@ if errorlevel 1 (
 if not exist "%CODEX_PORTABLE_TARGET%\ChatGPT.exe" (
     echo ERROR: Updated launcher was not found.
     goto :failed
+)
+
+echo.
+echo Refreshing the custom model catalog from config.toml...
+"%PYTHON_EXE%" -B "%CATALOG_SCRIPT%"
+if errorlevel 1 (
+    echo WARNING: The model catalog was not refreshed, so models served by the custom
+    echo          provider may be missing from the model picker. Fix the provider in
+    echo          config.toml and rerun this script. The portable update itself succeeded.
 )
 
 echo.

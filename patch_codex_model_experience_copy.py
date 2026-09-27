@@ -230,19 +230,27 @@ def find_single_asset(archive: AsarArchive, prefix: str) -> str:
     return matches[0]
 
 
-def find_asset_for_patch(
+def find_assets_for_patch(
     archive: AsarArchive,
     *,
     feature: str,
     legacy_prefix: str,
     required_needles: Sequence[bytes],
     patcher,
-) -> str:
+) -> tuple[str, ...]:
+    """Locate every asset that carries a patchable gate for ``feature``.
+
+    Older Codex builds shipped one small, lazily loaded chunk per gate, so the
+    ``legacy_prefix`` lookup is still preferred when it matches. Current builds
+    merge those chunks into the large ``app-initial-*`` and ``app-shared-*``
+    bundles, so one gate can legitimately live in more than one asset.
+    """
+
     legacy_matches = sorted(
         name for name in archive.asset_entries() if name.startswith(legacy_prefix)
     )
     if len(legacy_matches) == 1:
-        return legacy_matches[0]
+        return (legacy_matches[0],)
     if len(legacy_matches) > 1:
         raise PatchError(
             f"expected at most one asset matching {legacy_prefix}*, "
@@ -268,15 +276,14 @@ def find_asset_for_patch(
             continue
         content_matches.append(name)
 
-    if len(content_matches) == 1:
-        return content_matches[0]
-    if not content_matches and len(invalid_candidates) == 1:
-        name, error = invalid_candidates[0]
-        raise PatchError(f"{feature} candidate {name} is unsupported: {error}")
-    raise PatchError(
-        f"expected one content-matched asset for {feature}, found "
-        f"{len(content_matches)}: {content_matches}"
-    )
+    if invalid_candidates:
+        details = "; ".join(f"{name}: {error}" for name, error in invalid_candidates)
+        raise PatchError(f"{feature} has unsupported content-matched assets: {details}")
+    if not content_matches:
+        raise PatchError(
+            f"expected at least one content-matched asset for {feature}, found 0"
+        )
+    return tuple(content_matches)
 
 
 def fixed_comment(total_length: int, marker: str) -> str:
@@ -288,20 +295,96 @@ def fixed_comment(total_length: int, marker: str) -> str:
     return "/*" + marker + ("x" * (total_length - minimum)) + "*/"
 
 
+FAST_REQUEST_MARKER = "CFM_REQ"
+FAST_SAVED_REQUEST_MARKER = "CFM2"
+
+FAST_REQUEST_LEGACY_GATE = re.compile(
+    rf"if\((?P<auth>{IDENT})!==`chatgpt`\)return!1;"
+)
+FAST_REQUEST_AUTH_GATE = re.compile(
+    rf"if\((?P<auth>{IDENT})!==`chatgpt`&&(?P<auth2>{IDENT})!==`personalAccessToken`\)return!1;"
+)
+FAST_SAVED_REQUEST_GATE = re.compile(
+    rf"if\((?P<guard>!await\s*(?P<probe>{IDENT})\(\)\|\|)"
+    rf"\(await\s*(?P<client>{IDENT})\.sendRequest\(`configRequirements/read`,"
+    rf"[^;]{{0,240}}?featureRequirements\?\.fast_mode===!1\)return null;"
+)
+
+
 def patch_fast_request(text: str) -> tuple[str, bool]:
-    marker = "CFM_REQ"
-    if marker in text:
-        return text, False
-    pattern = re.compile(rf"if\((?P<auth>{IDENT})!==`chatgpt`\)return!1;")
-    matches = list(pattern.finditer(text))
-    if len(matches) != 1 or "featureRequirements?.fast_mode" not in text:
+    """Remove every ChatGPT-only guard that gates the Fast Mode service tier.
+
+    Codex has shipped this guard in several shapes:
+
+    * ``if(auth !== `chatgpt`) return !1;``
+    * ``if(auth !== `chatgpt` && auth !== `personalAccessToken`) return !1;``
+    * ``if(!await probe() || (...configRequirements...fast_mode === !1))
+      return null;`` for the saved-service-tier reader.
+
+    Every matched guard is replaced by an equal-length comment so the ASAR
+    offsets and integrity metadata stay untouched. The host/model feature
+    requirement check (``fast_mode !== !1``) is intentionally preserved.
+    """
+
+    edits: list[tuple[int, int, str]] = []
+
+    if FAST_REQUEST_MARKER not in text:
+        for label, pattern in (
+            ("legacy", FAST_REQUEST_LEGACY_GATE),
+            ("auth", FAST_REQUEST_AUTH_GATE),
+        ):
+            matches = list(pattern.finditer(text))
+            if len(matches) > 1:
+                raise PatchError(
+                    "Fast request gate is unsupported or ambiguous: "
+                    f"expected at most one {label} ChatGPT early-return gate, "
+                    f"found {len(matches)}"
+                )
+            for match in matches:
+                edits.append(
+                    (
+                        match.start(),
+                        match.end(),
+                        fixed_comment(len(match.group(0)), FAST_REQUEST_MARKER),
+                    )
+                )
+
+    if FAST_SAVED_REQUEST_MARKER not in text:
+        matches = list(FAST_SAVED_REQUEST_GATE.finditer(text))
+        if len(matches) > 1:
+            raise PatchError(
+                "Fast request gate is unsupported or ambiguous: "
+                f"expected at most one saved-service-tier probe, found {len(matches)}"
+            )
+        for match in matches:
+            guard = match.group("guard")
+            edits.append(
+                (
+                    match.start("guard"),
+                    match.end("guard"),
+                    fixed_comment(len(guard), FAST_SAVED_REQUEST_MARKER),
+                )
+            )
+
+    if not edits:
+        if FAST_REQUEST_MARKER in text or FAST_SAVED_REQUEST_MARKER in text:
+            return text, False
         raise PatchError(
-            "Fast request gate is unsupported or ambiguous: "
-            f"expected one ChatGPT early-return gate, found {len(matches)}"
+            "Fast request gate is unsupported or ambiguous: expected one ChatGPT "
+            "early-return gate or saved-service-tier probe, found 0"
         )
-    match = matches[0]
-    replacement = fixed_comment(len(match.group(0)), marker)
-    return text[: match.start()] + replacement + text[match.end() :], True
+
+    edits.sort()
+    previous_end = -1
+    for start, end, _replacement in edits:
+        if start < previous_end:
+            raise PatchError("Fast request gate replacements overlap")
+        previous_end = end
+
+    patched = text
+    for start, end, replacement in reversed(edits):
+        patched = patched[:start] + replacement + patched[end:]
+    return patched, True
 
 
 def patch_fast_ui(text: str) -> tuple[str, bool]:
@@ -538,7 +621,7 @@ def build_patch_plan(
         (
             "Fast request gate",
             "read-service-tier-for-request-",
-            (b"featureRequirements?.fast_mode", b"`chatgpt`"),
+            (b"featureRequirements?.fast_mode", b"chatgpt"),
             patch_fast_request,
         ),
         (
@@ -548,23 +631,16 @@ def build_patch_plan(
             patch_fast_ui,
         ),
     ]
-    targets = tuple(
-        (
-            feature,
-            find_asset_for_patch(
-                archive,
-                feature=feature,
-                legacy_prefix=legacy_prefix,
-                required_needles=required_needles,
-                patcher=patcher,
-            ),
-            patcher,
-        )
-        for feature, legacy_prefix, required_needles, patcher in target_specs
-    )
     targets_by_asset: dict[str, list[tuple[str, object]]] = defaultdict(list)
-    for feature, name, patcher in targets:
-        targets_by_asset[f"webview/assets/{name}"].append((feature, patcher))
+    for feature, legacy_prefix, required_needles, patcher in target_specs:
+        for name in find_assets_for_patch(
+            archive,
+            feature=feature,
+            legacy_prefix=legacy_prefix,
+            required_needles=required_needles,
+            patcher=patcher,
+        ):
+            targets_by_asset[f"webview/assets/{name}"].append((feature, patcher))
 
     patches: list[AssetPatch] = []
     for name, grouped_targets in targets_by_asset.items():

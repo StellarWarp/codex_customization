@@ -5,8 +5,12 @@ Desktop while keeping the installed Microsoft Store/MSIX package unchanged.
 
 The portable build enables Fast Mode.
 
-Model availability and hidden-model behavior are left unchanged and follow the
-official Codex Desktop implementation.
+Codex Desktop builds its model picker from the app-server `model/list` call.
+For a custom `model_provider` that call only returns the ChatGPT account
+catalog, so models served by a local OpenAI-compatible gateway never appear in
+the picker. The tooling points the top-level `model_catalog_json` setting at a
+catalog generated from the provider's `/v1/models` endpoint, which keeps the
+custom models selectable while reading their metadata from the official catalog.
 
 ## Configuration
 
@@ -28,10 +32,13 @@ local file. Git ignores the local file.
 
 ## Commands
 
-- `update_codex_portable.cmd`: validate, rebuild, replace, and launch the
-  portable copy.
+- `update_codex_portable.cmd`: validate, rebuild, replace, refresh the model
+  catalog, and launch the portable copy.
 - `launch_codex_portable.cmd`: launch the custom portable copy through the
   configured proxy.
+- `sync_codex_model_catalog.py`: rebuild
+  `%USERPROFILE%\.codex\model_catalog.json` from the active provider and make
+  `config.toml` reference it. Backs up `config.toml` before the first write.
 - `launch_original_codex.cmd`: launch the registered original Codex package
   through the configured proxy.
 - `install_codex_start_menu_shortcuts.cmd`: install `Codex Original` and
@@ -43,6 +50,22 @@ validation. Remove the Start Menu shortcuts with:
 ```cmd
 install_codex_start_menu_shortcuts.cmd --remove
 ```
+
+## Portable launch and package identity
+
+A portable copy that lives outside an MSIX package cannot start on its own: the
+bootstrap calls `getCurrentPackageFamily()` and aborts with "the process has
+no package identity". The portable launcher therefore starts the executable
+through `Invoke-CommandInDesktopPackage` against the registered `OpenAI.Codex`
+package, which borrows that identity without modifying the Store install.
+Codex Desktop must be installed and registered for the portable copy to run.
+
+Environment variables are not inherited by the packaged child, so
+`HTTP_PROXY`/`HTTPS_PROXY` set by the launcher do not reach the app. The app
+uses the Windows user proxy instead; the launcher checks that
+`ProxyEnable`/`ProxyServer` match `CODEX_PROXY` and warns when they do not.
+The portable copy shares Electron user data and the single-instance lock with the
+official app, so close any running Codex Desktop before starting it.
 
 ## New Computer
 

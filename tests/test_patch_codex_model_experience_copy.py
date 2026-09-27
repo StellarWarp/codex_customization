@@ -15,6 +15,35 @@ UI_NAME = "use-service-tier-settings-TEST.js"
 INITIAL_NAME = "app-initial-TEST.js"
 MODEL_VISIBILITY_NAME = "model-visibility-TEST.js"
 
+# Codex 26.9x merged the lazily loaded gate chunks into the large app bundles
+# and widened the ChatGPT-only auth check.
+NEW_INITIAL_NAME = "app-initial-NEW.js"
+NEW_SHARED_NAME = "app-shared-NEW.js"
+
+NEW_AUTH_GATE_ASSET = (
+    "import{x}from'./x.js';"
+    "async function T(e,t){let n=await x(e,t);"
+    "if(n!==`chatgpt`&&n!==`personalAccessToken`)return!1;"
+    "let r=await v(t,{priority:`critical`});"
+    "return e.query.setData(g,{authMethod:n,hostId:t},r),"
+    "r.requirements?.featureRequirements?.fast_mode!==!1}"
+    "async function unrelated(e){if(!await probe(e)||!ready())return!1;"
+    "return!0}"
+).encode()
+
+NEW_SAVED_GATE_ASSET = (
+    "import{x}from'./x.js';"
+    "async function E(e,t,n,r){try{"
+    "if(!await r()||(await e.sendRequest(`configRequirements/read`,void 0,"
+    "{priority:`critical`})).requirements?.featureRequirements?.fast_mode===!1)"
+    "return null;"
+    "let{config:t}=await e.sendRequest(`config/read`,{includeLayers:!1,cwd:null},"
+    "{priority:`critical`});"
+    "return null}catch(e){return null}}"
+    "async function probe(e){"
+    "return(await e.getAccount({priority:`critical`})).account?.type===`chatgpt`}"
+).encode()
+
 
 def sha256(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
@@ -175,6 +204,62 @@ class CodexPatchTests(unittest.TestCase):
         patched = asset_patch.new_bytes.decode()
         self.assertIn("CFM_REQ", patched)
         self.assertIn("||d   ,p=1&&!f", patched)
+
+    def test_new_build_gates_are_patched_in_both_bundles(self) -> None:
+        ui = make_test_assets()[UI_NAME]
+        assets = {
+            NEW_INITIAL_NAME: NEW_AUTH_GATE_ASSET + ui,
+            NEW_SHARED_NAME: NEW_SAVED_GATE_ASSET,
+        }
+        _, app_dir = make_package(self.root, assets)
+        plan = patcher.build_patch_plan(
+            app_dir,
+            check_javascript=False,
+            scan_embedded_hashes=False,
+        )
+        by_name = {asset_patch.name: asset_patch for asset_patch in plan.asset_patches}
+        self.assertEqual(
+            set(by_name),
+            {
+                f"webview/assets/{NEW_INITIAL_NAME}",
+                f"webview/assets/{NEW_SHARED_NAME}",
+            },
+        )
+
+        initial_patch = by_name[f"webview/assets/{NEW_INITIAL_NAME}"]
+        shared_patch = by_name[f"webview/assets/{NEW_SHARED_NAME}"]
+        self.assertEqual(len(initial_patch.new_bytes), len(initial_patch.old_bytes))
+        self.assertEqual(len(shared_patch.new_bytes), len(shared_patch.old_bytes))
+
+        initial = initial_patch.new_bytes.decode()
+        shared = shared_patch.new_bytes.decode()
+        self.assertIn("CFM_REQ", initial)
+        self.assertNotIn("if(n!==`chatgpt`&&n!==`personalAccessToken`)return!1;", initial)
+        self.assertIn("||d   ,p=1&&!f", initial)
+        self.assertIn("CFM2", shared)
+        self.assertNotIn("!await r()||", shared)
+        self.assertIn(
+            "featureRequirements?.fast_mode===!1)return null;",
+            shared,
+        )
+
+    def test_fast_request_patcher_is_idempotent_for_new_shapes(self) -> None:
+        for source in (NEW_AUTH_GATE_ASSET, NEW_SAVED_GATE_ASSET):
+            text = source.decode()
+            patched, changed = patcher.patch_fast_request(text)
+            self.assertTrue(changed)
+            self.assertEqual(len(patched), len(text))
+            again, changed_again = patcher.patch_fast_request(patched)
+            self.assertFalse(changed_again)
+            self.assertEqual(again, patched)
+
+    def test_fast_request_patcher_ignores_unrelated_await_probes(self) -> None:
+        text = (
+            "async function f(e){if(!await m(e)||!ready())return!1;"
+            "return e?.requirements?.featureRequirements?.fast_mode!==!1}"
+        )
+        with self.assertRaisesRegex(patcher.PatchError, "found 0"):
+            patcher.patch_fast_request(text)
 
     def test_apply_updates_assets_header_and_embedded_hash(self) -> None:
         _, source_app = make_package(self.root)
