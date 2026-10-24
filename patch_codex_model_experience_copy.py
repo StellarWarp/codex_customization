@@ -234,7 +234,7 @@ def find_assets_for_patch(
     archive: AsarArchive,
     *,
     feature: str,
-    legacy_prefix: str,
+    legacy_prefix: str | None,
     required_needles: Sequence[bytes],
     patcher,
 ) -> tuple[str, ...]:
@@ -246,16 +246,17 @@ def find_assets_for_patch(
     bundles, so one gate can legitimately live in more than one asset.
     """
 
-    legacy_matches = sorted(
-        name for name in archive.asset_entries() if name.startswith(legacy_prefix)
-    )
-    if len(legacy_matches) == 1:
-        return (legacy_matches[0],)
-    if len(legacy_matches) > 1:
-        raise PatchError(
-            f"expected at most one asset matching {legacy_prefix}*, "
-            f"found {len(legacy_matches)}: {legacy_matches}"
+    if legacy_prefix is not None:
+        legacy_matches = sorted(
+            name for name in archive.asset_entries() if name.startswith(legacy_prefix)
         )
+        if len(legacy_matches) == 1:
+            return (legacy_matches[0],)
+        if len(legacy_matches) > 1:
+            raise PatchError(
+                f"expected at most one asset matching {legacy_prefix}*, "
+                f"found {len(legacy_matches)}: {legacy_matches}"
+            )
 
     content_matches: list[str] = []
     invalid_candidates: list[tuple[str, PatchError]] = []
@@ -279,10 +280,6 @@ def find_assets_for_patch(
     if invalid_candidates:
         details = "; ".join(f"{name}: {error}" for name, error in invalid_candidates)
         raise PatchError(f"{feature} has unsupported content-matched assets: {details}")
-    if not content_matches:
-        raise PatchError(
-            f"expected at least one content-matched asset for {feature}, found 0"
-        )
     return tuple(content_matches)
 
 
@@ -297,6 +294,8 @@ def fixed_comment(total_length: int, marker: str) -> str:
 
 FAST_REQUEST_MARKER = "CFM_REQ"
 FAST_SAVED_REQUEST_MARKER = "CFM2"
+FAST_EXECUTOR_MARKER = "CFM_TIER"
+FAST_UI_ACCESS_MARKER = "CFM_UI"
 
 FAST_REQUEST_LEGACY_GATE = re.compile(
     rf"if\((?P<auth>{IDENT})!==`chatgpt`\)return!1;"
@@ -310,20 +309,50 @@ FAST_SAVED_REQUEST_GATE = re.compile(
     rf"[^;]{{0,240}}?featureRequirements\?\.fast_mode===!1\)return null;"
 )
 
+# Codex 26.10x moved the Fast Mode gates onto an explicit auth-method allowlist
+# and dropped the ``featureRequirements?.fast_mode`` probe from the request
+# path. The gates now live in the app-initial bundle instead of the old
+# read-service-tier/use-service-tier chunks.
+FAST_REQUEST_ACCESS_GATE = re.compile(
+    rf"if\((?P<auth>{IDENT})!==`chatgpt`&&(?P=auth)!==`personalAccessToken`"
+    rf"&&(?P=auth)!==`amazonBedrock`\)return null;"
+)
+FAST_SAVED_ACCESS_PROBE = re.compile(
+    rf"if\(!await\s*(?P<probe>{IDENT})\(\)\)return null;"
+    rf"(?=\s*let\s+(?P<request>{IDENT})=await\s+(?P<client>{IDENT})"
+    rf"\.sendRequest\(`configRequirements/read`,)"
+)
+FAST_EXECUTOR_ACCESS_GATE = re.compile(
+    rf"return\s+(?P<account>{IDENT})\?\.type===`chatgpt`\|\|"
+    rf"(?P=account)\?\.type===`amazonBedrock`\?"
+    rf"(?P<tier>{IDENT})\.serviceTier:null"
+)
+FAST_UI_ACCESS_GATE = re.compile(
+    rf"(?P<access>{IDENT})=(?P<state>{IDENT})\?\.authMethod===`chatgpt`\|\|"
+    rf"(?P=state)\?\.authMethod===`personalAccessToken`\|\|"
+    rf"(?P=state)\?\.authMethod===`amazonBedrock`"
+)
+
 
 def patch_fast_request(text: str) -> tuple[str, bool]:
-    """Remove every ChatGPT-only guard that gates the Fast Mode service tier.
+    """Remove every auth guard that gates the Fast Mode service tier.
 
     Codex has shipped this guard in several shapes:
 
     * ``if(auth !== `chatgpt`) return !1;``
     * ``if(auth !== `chatgpt` && auth !== `personalAccessToken`) return !1;``
+    * ``if(auth !== `chatgpt` && auth !== `personalAccessToken` &&
+      auth !== `amazonBedrock`) return null;``
     * ``if(!await probe() || (...configRequirements...fast_mode === !1))
       return null;`` for the saved-service-tier reader.
+    * ``return account?.type === `chatgpt` || account?.type ===
+      `amazonBedrock` ? tier : null`` for turn execution.
+    * ``if(!await probe()) return null;`` in the saved-service-tier reader.
 
-    Every matched guard is replaced by an equal-length comment so the ASAR
-    offsets and integrity metadata stay untouched. The host/model feature
-    requirement check (``fast_mode !== !1``) is intentionally preserved.
+    Every matched guard is replaced by an equal-length comment (or an
+    equal-length expression plus comment) so the ASAR offsets and integrity
+    metadata stay untouched. The host/model feature requirement check
+    (``fast_mode !== !1``) is intentionally preserved.
     """
 
     edits: list[tuple[int, int, str]] = []
@@ -332,12 +361,13 @@ def patch_fast_request(text: str) -> tuple[str, bool]:
         for label, pattern in (
             ("legacy", FAST_REQUEST_LEGACY_GATE),
             ("auth", FAST_REQUEST_AUTH_GATE),
+            ("auth-method", FAST_REQUEST_ACCESS_GATE),
         ):
             matches = list(pattern.finditer(text))
             if len(matches) > 1:
                 raise PatchError(
                     "Fast request gate is unsupported or ambiguous: "
-                    f"expected at most one {label} ChatGPT early-return gate, "
+                    f"expected at most one {label} auth early-return gate, "
                     f"found {len(matches)}"
                 )
             for match in matches:
@@ -366,12 +396,49 @@ def patch_fast_request(text: str) -> tuple[str, bool]:
                 )
             )
 
+        matches = list(FAST_SAVED_ACCESS_PROBE.finditer(text))
+        if len(matches) > 1:
+            raise PatchError(
+                "Fast request gate is unsupported or ambiguous: "
+                f"expected at most one saved-service-tier auth probe, "
+                f"found {len(matches)}"
+            )
+        for match in matches:
+            edits.append(
+                (
+                    match.start(),
+                    match.end(),
+                    fixed_comment(len(match.group(0)), FAST_SAVED_REQUEST_MARKER),
+                )
+            )
+
+    if FAST_EXECUTOR_MARKER not in text:
+        matches = list(FAST_EXECUTOR_ACCESS_GATE.finditer(text))
+        if len(matches) > 1:
+            raise PatchError(
+                "Fast request gate is unsupported or ambiguous: "
+                f"expected at most one executor account-type gate, "
+                f"found {len(matches)}"
+            )
+        for match in matches:
+            tier = match.group("tier")
+            prefix = f"return {tier}.serviceTier"
+            comment = fixed_comment(
+                len(match.group(0)) - len(prefix), FAST_EXECUTOR_MARKER
+            )
+            edits.append((match.start(), match.end(), prefix + comment))
+
     if not edits:
-        if FAST_REQUEST_MARKER in text or FAST_SAVED_REQUEST_MARKER in text:
+        if (
+            FAST_REQUEST_MARKER in text
+            or FAST_SAVED_REQUEST_MARKER in text
+            or FAST_EXECUTOR_MARKER in text
+        ):
             return text, False
         raise PatchError(
-            "Fast request gate is unsupported or ambiguous: expected one ChatGPT "
-            "early-return gate or saved-service-tier probe, found 0"
+            "Fast request gate is unsupported or ambiguous: expected an auth "
+            "early-return gate, saved-service-tier probe, or account-type gate, "
+            "found 0"
         )
 
     edits.sort()
@@ -401,37 +468,71 @@ def patch_fast_ui(text: str) -> tuple[str, bool]:
         rf"(?P=loading)&&(?P<data>{IDENT})!=null&&(?P=data)\?\.requirements\?\."
         r"featureRequirements\?\.fast_mode!==!1"
     )
-    if patched.search(text):
-        return text, False
-    matches = list(original.finditer(text))
-    if len(matches) != 1:
+
+    edits: list[tuple[int, int, str]] = []
+
+    if FAST_UI_ACCESS_MARKER not in text:
+        matches = list(FAST_UI_ACCESS_GATE.finditer(text))
+        if len(matches) > 1:
+            raise PatchError(
+                "Fast UI gate is unsupported or ambiguous: "
+                f"expected at most one auth-method allowlist, found {len(matches)}"
+            )
+        for match in matches:
+            access = match.group("access")
+            prefix = f"{access}=!0"
+            comment = fixed_comment(
+                len(match.group(0)) - len(prefix), FAST_UI_ACCESS_MARKER
+            )
+            edits.append((match.start(), match.end(), prefix + comment))
+
+    if not patched.search(text):
+        matches = list(original.finditer(text))
+        if len(matches) > 1:
+            raise PatchError(
+                "Fast UI gate is unsupported or ambiguous: "
+                f"expected one ChatGPT-only expression, found {len(matches)}"
+            )
+        for match in matches:
+            values = match.groupdict()
+            old_loading = (
+                f"{values['loading']}=!!{values['state']}?.isLoading||"
+                f"{values['chat']}&&{values['pending']}"
+            )
+            new_loading_base = (
+                f"{values['loading']}=!!{values['state']}?.isLoading||"
+                f"{values['pending']}"
+            )
+            if len(new_loading_base) > len(old_loading):
+                raise PatchError(
+                    "Fast UI loading replacement cannot remain equal-length"
+                )
+            new_loading = new_loading_base.ljust(len(old_loading))
+            truthy = "1".ljust(len(values["chat"]))
+            new_allowed = (
+                f"{values['allowed']}={truthy}&&!{values['loading']}&&"
+                f"{values['data']}!=null&&{values['data']}?.requirements?."
+                "featureRequirements?.fast_mode!==!1"
+            )
+            replacement = new_loading + "," + new_allowed
+            if len(replacement.encode("utf-8")) != len(
+                match.group(0).encode("utf-8")
+            ):
+                raise PatchError("Fast UI replacement changed the UTF-8 byte length")
+            edits.append((match.start(), match.end(), replacement))
+
+    if not edits:
+        if FAST_UI_ACCESS_MARKER in text or patched.search(text):
+            return text, False
         raise PatchError(
-            "Fast UI gate is unsupported or ambiguous: "
-            f"expected one ChatGPT-only expression, found {len(matches)}"
+            "Fast UI gate is unsupported or ambiguous: expected one ChatGPT-only "
+            "expression or auth-method allowlist, found 0"
         )
-    match = matches[0]
-    values = match.groupdict()
-    old_loading = (
-        f"{values['loading']}=!!{values['state']}?.isLoading||"
-        f"{values['chat']}&&{values['pending']}"
-    )
-    new_loading_base = (
-        f"{values['loading']}=!!{values['state']}?.isLoading||"
-        f"{values['pending']}"
-    )
-    if len(new_loading_base) > len(old_loading):
-        raise PatchError("Fast UI loading replacement cannot remain equal-length")
-    new_loading = new_loading_base.ljust(len(old_loading))
-    truthy = "1".ljust(len(values["chat"]))
-    new_allowed = (
-        f"{values['allowed']}={truthy}&&!{values['loading']}&&"
-        f"{values['data']}!=null&&{values['data']}?.requirements?."
-        "featureRequirements?.fast_mode!==!1"
-    )
-    replacement = new_loading + "," + new_allowed
-    if len(replacement.encode("utf-8")) != len(match.group(0).encode("utf-8")):
-        raise PatchError("Fast UI replacement changed the UTF-8 byte length")
-    return text[: match.start()] + replacement + text[match.end() :], True
+
+    patched_text = text
+    for start, end, replacement in reversed(sorted(edits)):
+        patched_text = patched_text[:start] + replacement + patched_text[end:]
+    return patched_text, True
 
 
 def compose_patchers(patchers):
@@ -630,8 +731,21 @@ def build_patch_plan(
             (b"isServiceTierAllowed", b"featureRequirements?.fast_mode"),
             patch_fast_ui,
         ),
+        (
+            "Fast request access gate",
+            None,
+            (b"Failed to read service tier for request", b"amazonBedrock"),
+            patch_fast_request,
+        ),
+        (
+            "Fast UI access gate",
+            None,
+            (b"serviceTierAccess", b"authMethod===`personalAccessToken`||"),
+            patch_fast_ui,
+        ),
     ]
     targets_by_asset: dict[str, list[tuple[str, object]]] = defaultdict(list)
+    matched_any = False
     for feature, legacy_prefix, required_needles, patcher in target_specs:
         for name in find_assets_for_patch(
             archive,
@@ -640,7 +754,12 @@ def build_patch_plan(
             required_needles=required_needles,
             patcher=patcher,
         ):
+            matched_any = True
             targets_by_asset[f"webview/assets/{name}"].append((feature, patcher))
+    if not matched_any:
+        raise PatchError(
+            "no supported Fast Mode gate assets were found in this Codex build"
+        )
 
     patches: list[AssetPatch] = []
     for name, grouped_targets in targets_by_asset.items():

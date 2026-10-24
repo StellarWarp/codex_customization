@@ -44,6 +44,28 @@ NEW_SAVED_GATE_ASSET = (
     "return(await e.getAccount({priority:`critical`})).account?.type===`chatgpt`}"
 ).encode()
 
+# Codex 26.10x replaced the featureRequirements probe with an explicit auth
+# allowlist and an account-type check on the executor path.
+CURRENT_ACCESS_ASSET = (
+    "async function T(e,t){let n=await x(e,t);"
+    "if(n!==`chatgpt`&&n!==`personalAccessToken`&&n!==`amazonBedrock`)return null;"
+    "let r=await v(t,{priority:`critical`});"
+    "return e.query.setData(g,{authMethod:n,hostId:t},r)}"
+    "async function E(e,t,n,r){try{if(!await r())return null;"
+    "let s=await e.sendRequest(`configRequirements/read`,void 0,"
+    "{priority:`critical`});"
+    "return null}catch(e){return e.logger.error(`Failed to read service tier "
+    "for request`),null}}"
+    "function Q(e){return async()=>{if(u==null)return null;"
+    "if(u.serviceTier==null)return null;"
+    "let{account:t}=await e.getAccount({priority:`critical`});"
+    "return t?.type===`chatgpt`||t?.type===`amazonBedrock`?u.serviceTier:null}}"
+    "function U(e){let i=x(e),a=i?.authMethod===`chatgpt`||"
+    "i?.authMethod===`personalAccessToken`||"
+    "i?.authMethod===`amazonBedrock`,o=i?.authMethod??null;"
+    "return{serviceTierAccess:a?f(c):null,isLoading:!1,authMethod:o}}"
+).encode()
+
 
 def sha256(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
@@ -252,6 +274,42 @@ class CodexPatchTests(unittest.TestCase):
             again, changed_again = patcher.patch_fast_request(patched)
             self.assertFalse(changed_again)
             self.assertEqual(again, patched)
+
+    def test_current_access_gates_are_patched(self) -> None:
+        _, app_dir = make_package(
+            self.root,
+            {"app-initial-CURRENT.js": CURRENT_ACCESS_ASSET},
+        )
+        plan = patcher.build_patch_plan(
+            app_dir,
+            check_javascript=False,
+            scan_embedded_hashes=False,
+        )
+        self.assertEqual(len(plan.asset_patches), 1)
+        asset_patch = plan.asset_patches[0]
+        self.assertEqual(len(asset_patch.new_bytes), len(asset_patch.old_bytes))
+        patched = asset_patch.new_bytes.decode()
+        for marker in ("CFM_REQ", "CFM2", "CFM_TIER", "CFM_UI"):
+            self.assertIn(marker, patched)
+        self.assertNotIn("!==`amazonBedrock`)return null;", patched)
+        self.assertNotIn("if(!await r())return null;", patched)
+        self.assertNotIn("?u.serviceTier:null", patched)
+
+    def test_current_access_patchers_are_idempotent(self) -> None:
+        text = CURRENT_ACCESS_ASSET.decode()
+        request_patched, changed = patcher.patch_fast_request(text)
+        self.assertTrue(changed)
+        self.assertEqual(len(request_patched), len(text))
+        again, changed_again = patcher.patch_fast_request(request_patched)
+        self.assertFalse(changed_again)
+        self.assertEqual(again, request_patched)
+
+        ui_patched, changed = patcher.patch_fast_ui(text)
+        self.assertTrue(changed)
+        self.assertEqual(len(ui_patched), len(text))
+        again, changed_again = patcher.patch_fast_ui(ui_patched)
+        self.assertFalse(changed_again)
+        self.assertEqual(again, ui_patched)
 
     def test_fast_request_patcher_ignores_unrelated_await_probes(self) -> None:
         text = (
