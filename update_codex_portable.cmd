@@ -112,6 +112,23 @@ if errorlevel 1 (
     echo          config.toml and rerun this script. The portable update itself succeeded.
 )
 
+set "SHORTCUT_INSTALLER=%SCRIPT_DIR%install_codex_start_menu_shortcuts.cmd"
+set "SHORTCUT_DIR=%APPDATA%\Microsoft\Windows\Start Menu\Programs\Codex"
+if exist "%SHORTCUT_DIR%\Codex Custom.lnk" (
+    echo.
+    echo Refreshing the Start Menu shortcuts so their icon follows the portable target...
+    if exist "%SHORTCUT_INSTALLER%" (
+        call "%SHORTCUT_INSTALLER%"
+        if errorlevel 1 echo WARNING: The Start Menu shortcuts could not be refreshed. Their icon may point at the previous portable target.
+    ) else (
+        echo WARNING: Shortcut installer not found:
+        echo   %SHORTCUT_INSTALLER%
+    )
+) else (
+    echo.
+    echo Start Menu shortcuts are not installed. Run install_codex_start_menu_shortcuts.cmd to add them.
+)
+
 echo.
 echo Update completed successfully. Launching Codex Portable...
 call "%PORTABLE_LAUNCHER%"

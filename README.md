@@ -33,7 +33,8 @@ local file. Git ignores the local file.
 ## Commands
 
 - `update_codex_portable.cmd`: validate, rebuild, replace, refresh the model
-  catalog, and launch the portable copy.
+  catalog, refresh the Start Menu shortcuts when they are already installed,
+  and launch the portable copy.
 - `launch_codex_portable.cmd`: launch the custom portable copy through the
   configured proxy.
 - `sync_codex_model_catalog.py`: rebuild
