@@ -5,12 +5,19 @@ Desktop while keeping the installed Microsoft Store/MSIX package unchanged.
 
 The portable build enables Fast Mode.
 
-Codex Desktop builds its model picker from the app-server `model/list` call.
-For a custom `model_provider` that call only returns the ChatGPT account
-catalog, so models served by a local OpenAI-compatible gateway never appear in
-the picker. The tooling points the top-level `model_catalog_json` setting at a
-catalog generated from the provider's `/v1/models` endpoint, which keeps the
-custom models selectable while reading their metadata from the official catalog.
+Model discovery stays with Codex and the configured provider. The tooling does
+not create or reference a `model_catalog.json`; a manually maintained catalog
+overrides provider discovery and goes stale whenever the provider changes its
+model list. For a custom provider that exposes a Codex model catalog endpoint,
+configure it on the provider, for example:
+
+```toml
+[model_providers.custom]
+model_catalog_url = "http://localhost:13244/v1/models"
+```
+
+Use `localhost` rather than `127.0.0.1` so Codex does not route the catalog
+request through the Windows system proxy.
 
 ## Configuration
 
@@ -32,14 +39,10 @@ local file. Git ignores the local file.
 
 ## Commands
 
-- `update_codex_portable.cmd`: validate, rebuild, replace, refresh the model
-  catalog, refresh the Start Menu shortcuts when they are already installed,
-  and launch the portable copy.
+- `update_codex_portable.cmd`: validate, rebuild, replace, refresh the Start
+  Menu shortcuts when they are already installed, and launch the portable copy.
 - `launch_codex_portable.cmd`: launch the custom portable copy through the
   configured proxy.
-- `sync_codex_model_catalog.py`: rebuild
-  `%USERPROFILE%\.codex\model_catalog.json` from the active provider and make
-  `config.toml` reference it. Backs up `config.toml` before the first write.
 - `launch_original_codex.cmd`: launch the registered original Codex package
   through the configured proxy.
 - `install_codex_start_menu_shortcuts.cmd`: install `Codex Original` and
